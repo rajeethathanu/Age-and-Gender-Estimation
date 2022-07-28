@@ -1,0 +1,367 @@
+import torch
+import torch.autograd.variable as Variable
+import torchvision
+import torchvision.transforms as transforms
+import torch.optim as optim
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.utils as utils
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from PIL import Image
+from shutil import copyfile
+
+
+!wget --user adiencedb --password adience http://www.cslab.openu.ac.il/download/adiencedb/AdienceBenchmarkOfUnfilteredFacesForGenderAndAgeClassification/aligned.tar.gz -P "/content/drive/MyDrive/gdrive/AgeGenderClassification/data"
+
+!tar xvzf "/content/drive/MyDrive/gdrive/AgeGenderClassification/data/aligned.tar.gz" -C "/content/drive/MyDrive/gdrive/AgeGenderClassification/data/"
+
+PATH_TO_FOLDS = "/content/drive/MyDrive/gdrive/AgeGenderClassification/data/train_val_txt_files_per_fold"
+PATH_TO_DATA = "/content/drive/MyDrive/gdrive/AgeGenderClassification/data"
+PATH_TO_IMAGE_FOLDERS = PATH_TO_DATA + "/aligned"
+
+class AdienceDataset(Dataset):
+    
+    def __init__(self, txt_file, root_dir, transform):
+        self.txt_file = txt_file
+        self.root_dir = root_dir
+        self.transform = transform
+        self.data = self.read_from_txt_file()
+    
+    def __len__(self):
+        return len(self.data)
+
+    def read_from_txt_file(self):
+        data = []
+        f = open(self.txt_file)
+        for line in f.readlines():
+            image_file, label = line.split()
+            label = int(label)
+            if 'gender' in self.txt_file:
+                label += 8
+            data.append((image_file, label))
+        return data
+    
+    def __getitem__(self, idx):
+        img_name, label = self.data[idx]
+        image = Image.open(self.root_dir + '/' + img_name)
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        return {
+            'image': image,
+            'label': label
+        }         
+        
+   transforms_list = [
+    transforms.Resize(256),
+    transforms.CenterCrop(227),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.RandomCrop(227)
+]
+
+transforms_dict = {
+    'train': {
+        0: list(transforms_list[i] for i in [0, 1, 3]),        # no transformation
+        1: list(transforms_list[i] for i in [0, 1, 2, 3]),     # random horizontal flip
+        2: list(transforms_list[i] for i in [0, 4, 2, 3])      # random crop and random horizontal flip
+    },
+    'val': {
+        0: list(transforms_list[i] for i in [0, 1, 3])
+    },
+    'test': {
+        0: list(transforms_list[i] for i in [0, 1, 3])
+    }
+}
+
+def get_dataloader(s, c, fold, transform_index, minibatch_size):
+    txt_file = f'{PATH_TO_FOLDS}/test_fold_is_{fold}/{c}_{s}.txt'
+    root_dir = PATH_TO_IMAGE_FOLDERS
+    transformed_dataset = AdienceDataset(txt_file, root_dir,transforms.Compose(transforms_dict[s][transform_index]))
+    dataloader = DataLoader(transformed_dataset, batch_size=minibatch_size, shuffle=True, num_workers=4)
+    
+    return dataloader
+   
+  device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+  
+  class Net(nn.Module):
+    
+    def __init__(self):
+        super(Net, self).__init__()
+        
+        self.conv1 = nn.Conv2d(3, 96, 7, stride = 4, padding = 1)
+        self.pool1 = nn.MaxPool2d(3, stride = 2, padding = 1)
+        self.norm1 = nn.LocalResponseNorm(size = 5, alpha = 0.0001, beta = 0.75)
+        
+        self.conv2 = nn.Conv2d(96, 256, 5, stride = 1, padding = 2)
+        self.pool2 = nn.MaxPool2d(3, stride = 2, padding = 1)
+        self.norm2 = nn.LocalResponseNorm(size = 5, alpha = 0.0001, beta = 0.75)
+        
+        self.conv3 = nn.Conv2d(256, 384, 3, stride = 1, padding = 1)
+        self.pool3 = nn.MaxPool2d(3, stride = 2, padding = 1)
+        self.norm3 = nn.LocalResponseNorm(size = 5, alpha = 0.0001, beta = 0.75)
+        
+        self.fc1 = nn.Linear(18816, 512)
+        self.dropout1 = nn.Dropout(0.25)
+
+        self.fc2 = nn.Linear(512, 512)
+        self.dropout2 = nn.Dropout(0.25)
+  
+        self.fc3 = nn.Linear(512, 10)
+    
+        self.apply(weights_init)
+
+    
+    def forward(self, x):
+        x = F.leaky_relu(self.conv1(x))
+        x = self.pool1(x)
+        x = self.norm1(x)
+
+        x = F.leaky_relu(self.conv2(x))
+        x = self.pool2(x)
+        x = self.norm2(x)
+      
+        x = F.leaky_relu(self.conv3(x))
+        x = self.pool3(x)
+        x = self.norm3(x)
+      
+        x = x.view(-1, 18816)
+        
+        x = self.fc1(x)
+        x = F.leaky_relu(x)
+        x = self.dropout1(x)
+      
+        x = self.fc2(x)
+        x = F.leaky_relu(x)
+        x = self.dropout2(x)
+      
+        x = F.log_softmax(self.fc3(x), dim=1)
+  
+        return x
+       
+       
+   def weights_init(m):
+    if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+        nn.init.normal_(m.weight, mean=0, std=1e-2)
+    
+    criterion = nn.NLLLoss()
+    
+minibatch_size = 50
+num_epochs = 60
+lr = 0.0001  # initial learning rate
+
+def train(net, train_dataloader, epochs, filename, checkpoint_frequency, val_dataloader=None):
+    net.train()
+    optimizer = optim.Adam(net.parameters(), lr)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10000])
+    
+    training_loss, validation_loss = [], []
+    checkpoint = 0
+    iteration = 0
+    running_loss = 0
+    
+    for epoch in range(epochs):
+        
+        for i, batch in enumerate(train_dataloader):
+               #loss.backward() # compute updates for each parameter
+            optimizer.step() # make the updates for each parameter
+            scheduler.step()
+            
+            optimizer.zero_grad()
+            images, labels = batch['image'].to(device), batch['label'].to(device)
+            outputs = net(images)
+            loss = criterion(outputs, labels)
+            running_loss += float(loss.item())
+            loss.backward()
+            optimizer.step()
+                                    
+            if (iteration+1) % checkpoint_frequency == 0 and val_dataloader is not None:
+                training_loss.append(running_loss/checkpoint_frequency)
+                validation_loss.append(validate(net, val_dataloader))
+                print(f'minibatch:{i}, epoch:{epoch}, iteration:{iteration}, training_error:{training_loss[-1]}, validation_error:{validation_loss[-1]}')
+                save_network(net, f'{filename}_checkpoint{checkpoint}')
+                checkpoint += 1
+                running_loss = 0
+            
+            iteration += 1
+
+    return net, training_loss, validation_loss
+    
+    
+def validate(net, dataloader):
+    net.train()
+    total_loss = 0
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            images, labels = batch['image'].to(device), batch['label'].to(device)
+            outputs = net(images)
+            loss = criterion(outputs, labels)
+            total_loss += float(loss.item())
+
+    return total_loss/(i+1)
+    
+def get_model_filename(c, fold, train_transform_index):
+    start_of_filename = f'{fold}_{c}_train_{train_transform_index}_checkpoint'
+    for file in os.listdir(PATH_TO_MODELS):
+        if file.startswith(start_of_filename):
+            return file
+            
+def get_validation_error(c, fold, train_transform_index):
+    filename = get_model_filename(c, fold, train_transform_index)
+    net = Net().to(device)
+    net.load_state_dict(torch.load(f'{PATH_TO_MODELS}/{filename}'))
+    return validate(net, get_dataloader('val', c, fold, 0, minibatch_size))
+    
+def test(net, dataloader, c):
+    result = {
+        'exact_match': 0,
+        'total': 0
+    }
+    if c == 'age':
+        result['one_off_match'] = 0
+
+    with torch.no_grad():
+        net.eval()
+        for i, batch in enumerate(dataloader):
+            images, labels = batch['image'].to(device), batch['label'].to(device)
+            outputs = net(images)
+            outputs = torch.tensor(list(map(lambda x: torch.max(x, 0)[1], outputs))).to(device)
+            result['total'] += len(outputs)
+            result['exact_match'] += sum(outputs == labels).item()
+            if c == 'age':
+                result['one_off_match'] += (sum(outputs==labels) +
+                                            sum(outputs==labels-1) +
+                                            sum(outputs==labels+1)).item()
+
+    return result           
+    
+def save_network(net, filename):
+    torch.save(net.state_dict(), f'{PATH_TO_MODELS}/{filename}.pt')
+    
+def choose_model_with_least_val_error(c, fold, train_transform_index, validation_loss):
+  
+    index = validation_loss.index(min(validation_loss))
+    filename = f'{fold}_{c}_train_{train_transform_index}'
+    for file in os.listdir(PATH_TO_MODELS):
+        if file.startswith(filename):
+            if file.startswith(f'{filename}_checkpoint{index}'):
+                pass
+            else:
+                os.remove(f'{PATH_TO_MODELS}/{file}')
+                
+def train_save(c, fold, train_transform_index, checkpoint_frequency=30):
+    trained_net, training_loss, validation_loss = train(
+        Net().to(device),
+        get_dataloader('train', c, fold, train_transform_index, minibatch_size),
+        num_epochs,
+        f'{fold}_{c}_train_{train_transform_index}',
+        checkpoint_frequency,
+        get_dataloader('val', c, fold, 0, minibatch_size)
+    )
+    
+    plt.plot(list(map(lambda x: checkpoint_frequency * x, (list(range(1, len(validation_loss)+1))))), validation_loss, label='validation_loss')
+    plt.plot(list(map(lambda x: checkpoint_frequency * x, (list(range(1, len(training_loss)+1))))), training_loss, label='training_loss')
+    plt.legend(bbox_to_anchor=(0., 1.02, 1., .102), loc=3,ncol=2, mode="expand", borderaxespad=0.)
+    plt.xlabel('iterations')
+    plt.ylabel('loss')
+    plt.show()
+    
+    choose_model_with_least_val_error(c, fold, train_transform_index, validation_loss)
+    
+    return validation_loss
+    
+ def pick_best_model(c):
+    def fn_filter(file):
+        file_split = file.split('_')
+        return True if (len(file_split) == 5 and file_split[1] == c) else False
+    
+    def fn_map(file):
+        file_split = file.split('_')
+        return get_validation_error(c, file_split[0], file_split[3])
+    
+    files = list(filter(fn_filter, os.listdir(PATH_TO_MODELS)))
+    val_errors = list(map(fn_map, files))
+    min_val_error, file = min(zip(val_errors, files))
+    best_model = f'{PATH_TO_MODELS}/{file.split(".")[0]}_best.pt'
+    copyfile(f'{PATH_TO_MODELS}/{file}', best_model)
+    
+    print(f'Picking {best_model} as the best model for {c}...')
+    
+def get_validation_error(c, fold, train_transform_index):
+    filename = get_model_filename(c, fold, train_transform_index)
+    net = Net().to(device)
+    net.load_state_dict(torch.load(f'{PATH_TO_MODELS}/{filename}'))
+    return validate(net, get_dataloader('val', c, fold, 0, minibatch_size))
+    
+ def get_performance_of_a_model(s, c, fold, train_transform_index):
+    filename = get_model_filename(c, fold, train_transform_index)
+    net = Net().to(device)
+    net.load_state_dict(torch.load(f'{PATH_TO_MODELS}/{filename}'))
+    performance = test(
+        net,
+        get_dataloader(s, c, fold, 0, minibatch_size),
+        c
+    )
+    if c == 'age':
+        return {
+            'accuracy': performance['exact_match']/performance['total'],
+            'one-off accuracy': performance['one_off_match']/performance['total']
+        }
+    elif c == 'gender':
+        return {
+            'accuracy': performance['exact_match']/performance['total']
+        }
+        
+        
+def get_performance(c):   
+    file = get_best_model_filename(c).split('_')
+    return get_performance_of_a_model('test', file[1], file[0], file[3])
+    
+def get_best_model_filename(c):
+    def fn_filter(file):
+        file_split = file.split('_')
+        return True if (len(file_split) == 6 and file_split[1] == c) else False
+    
+    return list(filter(fn_filter, os.listdir(PATH_TO_MODELS)))[0]
+   
+PATH_TO_AGE_MODEL = f'{PATH_TO_MODELS}/age.pt'
+PATH_TO_GENDER_MODEL = f'{PATH_TO_MODELS}/gender.pt' 
+
+mapping = {
+    0: '0-2 years',
+    1: '4-6 years',
+    2: '8-13 years',
+    3: '15-20 years',
+    4: '25-32 years',
+    5: '38-43 years',
+    6: '48-53 years',
+    7: '60 years or above',
+    8: 'male',
+    9: 'female'
+}
+
+def test_on_a_class(c, image_tensor):
+    with torch.no_grad():
+        net = Net().to(device)
+        net.load_state_dict(torch.load(f'{PATH_TO_MODELS}/{c}.pt'))
+        net.eval()       
+        output = net(image_tensor)
+        output = torch.max(output, 1)[1].to(device)
+        result = f'{c} = {mapping[output.item()]}'
+
+    return result    
+    
+def test(path):
+    image = Image.open(path)
+    plt.imshow(image)
+    image = transforms.Compose(transforms_dict['test'][0])(image)
+    image.unsqueeze_(0)
+    image = image.to(device)
+    print(test_on_a_class('age', image))
+    print(test_on_a_class('gender', image))
+    
+test('/content/drive/MyDrive/gdrive/AgeGenderClassification/test.jpg')   
